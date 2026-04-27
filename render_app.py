@@ -1,5 +1,6 @@
 import os
 import threading
+
 import uvicorn
 from fastapi import FastAPI
 
@@ -17,14 +18,7 @@ def home():
     }
 
 
-def run_bot():
-    bot_main()
-
-
-if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
+def run_web_server():
     port = int(os.getenv("PORT", 8000))
 
     uvicorn.run(
@@ -32,3 +26,17 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
+
+
+if __name__ == "__main__":
+    print("Запускаю web server для Render...", flush=True)
+
+    web_thread = threading.Thread(
+        target=run_web_server,
+        daemon=True,
+    )
+    web_thread.start()
+
+    print("Запускаю Telegram-бота...", flush=True)
+
+    bot_main()

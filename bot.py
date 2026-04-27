@@ -298,8 +298,11 @@ def main():
         )
     )
 
-    print("Бот запущен.")
-    app.run_polling()
+    print("Бот запущен.", flush=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        stop_signals=None,
+    )
 
 
 if __name__ == "__main__":
