@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 
@@ -22,6 +23,7 @@ def api_get(endpoint: str, params: dict) -> dict:
     """
     Универсальный GET-запрос к YouTube Data API.
     """
+    params = params.copy()
     params["key"] = API_KEY
 
     response = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=30)
@@ -63,42 +65,52 @@ def extract_channel_ref(text: str) -> str:
     return text
 
 
-def get_channel_info(channel_ref: str) -> dict:
+def get_channel_info(channel_input: str) -> dict:
     """
     Получает channel_id, название канала и uploads playlist.
     """
-    channel_ref = extract_channel_ref(channel_ref)
+    channel_ref = extract_channel_ref(channel_input)
 
-    params = {
-        "part": "snippet,contentDetails",
-        "maxResults": 1,
-    }
+    attempts = []
 
-    if channel_ref.startswith("@"):
-        params["forHandle"] = channel_ref
-    elif channel_ref.startswith("UC"):
-        params["id"] = channel_ref
+    if channel_ref.startswith("UC"):
+        attempts.append({"id": channel_ref})
+    elif channel_ref.startswith("@"):
+        attempts.append({"forHandle": channel_ref})
+        attempts.append({"forHandle": channel_ref.lstrip("@")})
     else:
-        # Старый username-формат.
-        # Для новых каналов лучше использовать @handle или /channel/UC...
-        params["forUsername"] = channel_ref
+        attempts.append({"forHandle": channel_ref})
+        attempts.append({"forHandle": f"@{channel_ref}"})
+        attempts.append({"forUsername": channel_ref})
 
-    data = api_get("channels", params)
+    last_data = None
 
-    items = data.get("items", [])
-    if not items:
-        raise RuntimeError(
-            "Канал не найден. Лучше вставь ссылку вида https://www.youtube.com/@handle "
-            "или https://www.youtube.com/channel/UC..."
-        )
+    for attempt in attempts:
+        params = {
+            "part": "snippet,contentDetails",
+            "maxResults": 1,
+        }
+        params.update(attempt)
 
-    item = items[0]
+        data = api_get("channels", params)
+        last_data = data
 
-    return {
-        "channel_id": item["id"],
-        "channel_title": item["snippet"]["title"],
-        "uploads_playlist_id": item["contentDetails"]["relatedPlaylists"]["uploads"],
-    }
+        items = data.get("items", [])
+        if items:
+            item = items[0]
+
+            return {
+                "channel_id": item["id"],
+                "channel_title": item["snippet"]["title"],
+                "uploads_playlist_id": item["contentDetails"]["relatedPlaylists"]["uploads"],
+            }
+
+    raise RuntimeError(
+        "Канал не найден. Лучше вставь ссылку вида:\n"
+        "https://www.youtube.com/@handle\n"
+        "или:\n"
+        "https://www.youtube.com/channel/UC..."
+    )
 
 
 def get_all_videos_from_uploads_playlist(playlist_id: str) -> list[dict]:
@@ -121,18 +133,22 @@ def get_all_videos_from_uploads_playlist(playlist_id: str) -> list[dict]:
         data = api_get("playlistItems", params)
 
         for item in data.get("items", []):
-            snippet = item["snippet"]
-
-            # Иногда в плейлисте могут быть удалённые/приватные видео
+            snippet = item.get("snippet", {})
             resource_id = snippet.get("resourceId", {})
             video_id = resource_id.get("videoId")
 
             if not video_id:
                 continue
 
+            title = snippet.get("title", "")
+
+            # Пропускаем удалённые/приватные ролики
+            if title in ["Deleted video", "Private video"]:
+                continue
+
             videos.append({
                 "video_id": video_id,
-                "video_title": snippet.get("title", ""),
+                "video_title": title,
                 "published_at": snippet.get("publishedAt", ""),
                 "video_url": f"https://www.youtube.com/watch?v={video_id}",
             })
@@ -174,13 +190,13 @@ def get_replies_for_comment(parent_comment_id: str, video: dict) -> list[dict]:
             return replies
 
         for item in data.get("items", []):
-            snippet = item["snippet"]
+            snippet = item.get("snippet", {})
 
             replies.append({
                 "video_id": video["video_id"],
                 "video_title": video["video_title"],
                 "video_url": video["video_url"],
-                "comment_id": item["id"],
+                "comment_id": item.get("id", ""),
                 "parent_comment_id": parent_comment_id,
                 "is_reply": True,
                 "author": snippet.get("authorDisplayName", ""),
@@ -189,6 +205,7 @@ def get_replies_for_comment(parent_comment_id: str, video: dict) -> list[dict]:
                 "like_count": snippet.get("likeCount", 0),
                 "published_at": snippet.get("publishedAt", ""),
                 "updated_at": snippet.get("updatedAt", ""),
+                "error": "",
             })
 
         page_token = data.get("nextPageToken")
@@ -201,13 +218,17 @@ def get_replies_for_comment(parent_comment_id: str, video: dict) -> list[dict]:
     return replies
 
 
-def get_comments_for_video(video: dict) -> list[dict]:
+def get_comments_for_video(video: dict) -> tuple[list[dict], list[dict]]:
     """
     Получает все комментарии конкретного видео:
     - верхнеуровневые комментарии
     - ответы на них
+
+    Возвращает:
+    comments, errors
     """
     comments = []
+    errors = []
     page_token = None
 
     while True:
@@ -229,17 +250,31 @@ def get_comments_for_video(video: dict) -> list[dict]:
 
             if "commentsDisabled" in error_text:
                 print(f"Комментарии отключены: {video['video_title']}")
-                return comments
+                errors.append({
+                    "video_id": video["video_id"],
+                    "video_title": video["video_title"],
+                    "video_url": video["video_url"],
+                    "error": "commentsDisabled",
+                })
+                return comments, errors
 
             print(f"Ошибка при получении комментариев к видео {video['video_id']}: {e}")
-            return comments
+
+            errors.append({
+                "video_id": video["video_id"],
+                "video_title": video["video_title"],
+                "video_url": video["video_url"],
+                "error": error_text[:1000],
+            })
+
+            return comments, errors
 
         for item in data.get("items", []):
-            thread_snippet = item["snippet"]
-            top_comment = thread_snippet["topLevelComment"]
-            top_snippet = top_comment["snippet"]
+            thread_snippet = item.get("snippet", {})
+            top_comment = thread_snippet.get("topLevelComment", {})
+            top_snippet = top_comment.get("snippet", {})
 
-            top_comment_id = top_comment["id"]
+            top_comment_id = top_comment.get("id", "")
 
             comments.append({
                 "video_id": video["video_id"],
@@ -254,11 +289,12 @@ def get_comments_for_video(video: dict) -> list[dict]:
                 "like_count": top_snippet.get("likeCount", 0),
                 "published_at": top_snippet.get("publishedAt", ""),
                 "updated_at": top_snippet.get("updatedAt", ""),
+                "error": "",
             })
 
             total_reply_count = thread_snippet.get("totalReplyCount", 0)
 
-            if total_reply_count > 0:
+            if total_reply_count > 0 and top_comment_id:
                 replies = get_replies_for_comment(top_comment_id, video)
                 comments.extend(replies)
 
@@ -269,17 +305,24 @@ def get_comments_for_video(video: dict) -> list[dict]:
 
         time.sleep(0.1)
 
-    return comments
+    return comments, errors
 
 
 def safe_filename(name: str) -> str:
+    """
+    Делает безопасное имя файла.
+    """
     name = re.sub(r'[\\/*?:"<>|]', "_", name)
     name = name.strip()
     return name[:100] or "youtube_comments"
 
 
-def save_to_xlsx(rows: list[dict], filename: str):
+def save_to_xlsx(rows: list[dict], errors: list[dict], filename: str):
+    """
+    Сохраняет комментарии и ошибки в XLSX.
+    """
     wb = Workbook()
+
     ws = wb.active
     ws.title = "comments"
 
@@ -300,10 +343,20 @@ def save_to_xlsx(rows: list[dict], filename: str):
 
     ws.append(headers)
 
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
     for row in rows:
         ws.append([row.get(header, "") for header in headers])
 
-    # Автоширина колонок
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
     for column_cells in ws.columns:
         max_length = 0
         column_letter = get_column_letter(column_cells[0].column)
@@ -314,80 +367,169 @@ def save_to_xlsx(rows: list[dict], filename: str):
 
         ws.column_dimensions[column_letter].width = min(max_length + 2, 70)
 
-    # Чтобы текст комментариев переносился визуально
-    for row in ws.iter_rows(min_row=2):
-        row[8].alignment = row[8].alignment.copy(wrap_text=True)
+    # Лист с ошибками
+    ws_errors = wb.create_sheet("errors")
+
+    error_headers = [
+        "video_id",
+        "video_title",
+        "video_url",
+        "error",
+    ]
+
+    ws_errors.append(error_headers)
+
+    for cell in ws_errors[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for error in errors:
+        ws_errors.append([
+            error.get("video_id", ""),
+            error.get("video_title", ""),
+            error.get("video_url", ""),
+            error.get("error", ""),
+        ])
+
+    ws_errors.freeze_panes = "A2"
+    ws_errors.auto_filter.ref = ws_errors.dimensions
+
+    for row in ws_errors.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    for column_cells in ws_errors.columns:
+        max_length = 0
+        column_letter = get_column_letter(column_cells[0].column)
+
+        for cell in column_cells:
+            value = str(cell.value) if cell.value is not None else ""
+            max_length = max(max_length, len(value))
+
+        ws_errors.column_dimensions[column_letter].width = min(max_length + 2, 70)
 
     wb.save(filename)
 
-def parse_channel_to_xlsx(channel_input: str) -> dict:
+
+def parse_channel_to_xlsx(channel_input: str, progress_callback=None) -> dict:
     """
     Запускает полный парсинг канала и сохраняет результат в XLSX.
-    Возвращает информацию для Telegram-бота.
+    Может отправлять прогресс через progress_callback.
     """
 
     channel_info = get_channel_info(channel_input)
+
+    if progress_callback:
+        progress_callback({
+            "stage": "channel_found",
+            "channel_title": channel_info["channel_title"],
+            "videos_count": 0,
+            "comments_count": 0,
+            "errors_count": 0,
+            "current_video_index": 0,
+            "current_video_title": "",
+        })
 
     videos = get_all_videos_from_uploads_playlist(
         channel_info["uploads_playlist_id"]
     )
 
     all_comments = []
+    all_errors = []
+
+    if progress_callback:
+        progress_callback({
+            "stage": "videos_loaded",
+            "channel_title": channel_info["channel_title"],
+            "videos_count": len(videos),
+            "comments_count": 0,
+            "errors_count": 0,
+            "current_video_index": 0,
+            "current_video_title": "",
+        })
 
     for index, video in enumerate(videos, start=1):
         print(f"[{index}/{len(videos)}] {video['video_title']}")
 
-        video_comments = get_comments_for_video(video)
+        if progress_callback:
+            progress_callback({
+                "stage": "video_started",
+                "channel_title": channel_info["channel_title"],
+                "videos_count": len(videos),
+                "comments_count": len(all_comments),
+                "errors_count": len(all_errors),
+                "current_video_index": index,
+                "current_video_title": video["video_title"],
+            })
+
+        video_comments, video_errors = get_comments_for_video(video)
+
         all_comments.extend(video_comments)
+        all_errors.extend(video_errors)
 
         print(
             f"Комментарии у видео: {len(video_comments)} | "
-            f"Всего собрано: {len(all_comments)}"
+            f"Всего собрано: {len(all_comments)} | "
+            f"Ошибок: {len(all_errors)}"
         )
 
+        if progress_callback:
+            progress_callback({
+                "stage": "video_finished",
+                "channel_title": channel_info["channel_title"],
+                "videos_count": len(videos),
+                "comments_count": len(all_comments),
+                "errors_count": len(all_errors),
+                "current_video_index": index,
+                "current_video_title": video["video_title"],
+            })
+
     filename = safe_filename(channel_info["channel_title"]) + "_comments.xlsx"
-    save_to_xlsx(all_comments, filename)
+
+    if progress_callback:
+        progress_callback({
+            "stage": "saving_xlsx",
+            "channel_title": channel_info["channel_title"],
+            "videos_count": len(videos),
+            "comments_count": len(all_comments),
+            "errors_count": len(all_errors),
+            "current_video_index": len(videos),
+            "current_video_title": "",
+        })
+
+    save_to_xlsx(all_comments, all_errors, filename)
+
+    if progress_callback:
+        progress_callback({
+            "stage": "xlsx_saved",
+            "channel_title": channel_info["channel_title"],
+            "videos_count": len(videos),
+            "comments_count": len(all_comments),
+            "errors_count": len(all_errors),
+            "current_video_index": len(videos),
+            "current_video_title": "",
+        })
 
     return {
         "filename": filename,
         "channel_title": channel_info["channel_title"],
         "videos_count": len(videos),
         "comments_count": len(all_comments),
+        "errors_count": len(all_errors),
     }
 
 
 def main():
     channel_input = input("Вставь @handle, ссылку на канал или channel_id: ").strip()
 
-    channel_info = get_channel_info(channel_input)
+    result = parse_channel_to_xlsx(channel_input)
 
-    print(f"Канал: {channel_info['channel_title']}")
-    print(f"Channel ID: {channel_info['channel_id']}")
-    print(f"Uploads playlist: {channel_info['uploads_playlist_id']}")
-
-    videos = get_all_videos_from_uploads_playlist(
-        channel_info["uploads_playlist_id"]
-    )
-
-    print(f"Всего видео найдено: {len(videos)}")
-
-    all_comments = []
-
-    for index, video in enumerate(videos, start=1):
-        print(f"\n[{index}/{len(videos)}] {video['video_title']}")
-        video_comments = get_comments_for_video(video)
-        all_comments.extend(video_comments)
-
-        print(
-            f"Комментарии у видео: {len(video_comments)} | "
-            f"Всего собрано: {len(all_comments)}"
-        )
-
-    filename = safe_filename(channel_info["channel_title"]) + "_comments.xlsx"
-    save_to_xlsx(all_comments, filename)
-
-    print(f"\nГотово. Файл сохранён: {filename}")
-    print(f"Всего строк с комментариями: {len(all_comments)}")
+    print("\nГотово.")
+    print(f"Канал: {result['channel_title']}")
+    print(f"Видео: {result['videos_count']}")
+    print(f"Комментариев: {result['comments_count']}")
+    print(f"Ошибок: {result['errors_count']}")
+    print(f"Файл: {result['filename']}")
 
 
 if __name__ == "__main__":
