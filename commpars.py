@@ -320,6 +320,41 @@ def save_to_xlsx(rows: list[dict], filename: str):
 
     wb.save(filename)
 
+def parse_channel_to_xlsx(channel_input: str) -> dict:
+    """
+    Запускает полный парсинг канала и сохраняет результат в XLSX.
+    Возвращает информацию для Telegram-бота.
+    """
+
+    channel_info = get_channel_info(channel_input)
+
+    videos = get_all_videos_from_uploads_playlist(
+        channel_info["uploads_playlist_id"]
+    )
+
+    all_comments = []
+
+    for index, video in enumerate(videos, start=1):
+        print(f"[{index}/{len(videos)}] {video['video_title']}")
+
+        video_comments = get_comments_for_video(video)
+        all_comments.extend(video_comments)
+
+        print(
+            f"Комментарии у видео: {len(video_comments)} | "
+            f"Всего собрано: {len(all_comments)}"
+        )
+
+    filename = safe_filename(channel_info["channel_title"]) + "_comments.xlsx"
+    save_to_xlsx(all_comments, filename)
+
+    return {
+        "filename": filename,
+        "channel_title": channel_info["channel_title"],
+        "videos_count": len(videos),
+        "comments_count": len(all_comments),
+    }
+
 
 def main():
     channel_input = input("Вставь @handle, ссылку на канал или channel_id: ").strip()
