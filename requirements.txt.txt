@@ -2,3 +2,5 @@ python-telegram-bot
 python-dotenv
 requests
 openpyxl
+fastapi
+uvicorn
